@@ -46,6 +46,21 @@ try {
     db.run(`ALTER TABLE threads ADD COLUMN working_dir TEXT`);
 } catch {} // Column may already exist
 
+// Add context column for notification threads (migration)
+try {
+    db.run(`ALTER TABLE threads ADD COLUMN context TEXT`);
+} catch {} // Column may already exist
+
+// Add needs_init flag for pre-registered threads (migration)
+try {
+    db.run(`ALTER TABLE threads ADD COLUMN needs_init INTEGER DEFAULT 0`);
+} catch {} // Column may already exist
+
+// Add webhook_url column for webhook-routed threads (migration)
+try {
+    db.run(`ALTER TABLE threads ADD COLUMN webhook_url TEXT`);
+} catch {} // Column may already exist
+
 // Create index for faster lookups
 db.run(`
     CREATE INDEX IF NOT EXISTS idx_threads_session
@@ -76,6 +91,65 @@ export function getChannelConfigCached(channelId: string): { working_dir: string
     const data = getChannelConfig(channelId);
     channelConfigCache.set(channelId, { data, expiresAt: now + CACHE_TTL_MS });
     return data;
+}
+
+export function registerThread(
+    threadId: string,
+    sessionId: string,
+    workingDir: string,
+    context: string | null
+): void {
+    db.run(
+        'INSERT INTO threads (thread_id, session_id, working_dir, context, needs_init) VALUES (?, ?, ?, ?, ?)',
+        [threadId, sessionId, workingDir, context, context ? 1 : 0]
+    );
+}
+
+export function clearThreadInit(threadId: string): void {
+    db.run(
+        'UPDATE threads SET needs_init = 0 WHERE thread_id = ?',
+        [threadId]
+    );
+}
+
+export function registerWebhookThread(threadId: string, webhookUrl: string): void {
+    db.run(
+        `INSERT INTO threads (thread_id, session_id, webhook_url) VALUES (?, ?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET webhook_url = ?`,
+        [threadId, 'webhook', webhookUrl, webhookUrl]
+    );
+}
+
+// Button handlers table — persists across restarts
+db.run(`
+    CREATE TABLE IF NOT EXISTS button_handlers (
+        custom_id TEXT PRIMARY KEY,
+        handler_json TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+`);
+
+export function saveButtonHandler(customId: string, handler: unknown): void {
+    db.run(
+        'INSERT OR REPLACE INTO button_handlers (custom_id, handler_json) VALUES (?, ?)',
+        [customId, JSON.stringify(handler)]
+    );
+}
+
+export function loadButtonHandler(customId: string): unknown | null {
+    const row = db.query('SELECT handler_json FROM button_handlers WHERE custom_id = ?')
+        .get(customId) as { handler_json: string } | null;
+    return row ? JSON.parse(row.handler_json) : null;
+}
+
+export function deleteButtonHandler(customId: string): void {
+    db.run('DELETE FROM button_handlers WHERE custom_id = ?', [customId]);
+}
+
+export function deleteButtonHandlers(customIds: string[]): void {
+    if (customIds.length === 0) return;
+    const placeholders = customIds.map(() => '?').join(',');
+    db.run(`DELETE FROM button_handlers WHERE custom_id IN (${placeholders})`, customIds);
 }
 
 export function setChannelConfig(channelId: string, workingDir: string): void {

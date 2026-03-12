@@ -16,14 +16,18 @@ import {
     TextChannel,
     ThreadAutoArchiveDuration,
     SlashCommandBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    WebhookClient,
     type Interaction,
+    type Webhook,
 } from 'discord.js';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
-import { claudeQueue } from './queue.js';
-import { db, getChannelConfigCached, setChannelConfig } from './db.js';
-import { startApiServer, buttonHandlers } from './api.js';
+import { claudeQueue, type Attachment } from './queue.js';
+import { db, getChannelConfigCached, setChannelConfig, clearThreadInit, loadButtonHandler, deleteButtonHandlers } from './db.js';
+import { startApiServer, buttonHandlers, activeActionMessages } from './api.js';
 
 // Allowed working directories (configurable via env, comma-separated)
 // If not set, any existing directory is allowed (backward compatible)
@@ -63,8 +67,58 @@ function validateWorkingDir(dir: string): string | null {
     return null;
 }
 
+// Board meeting API base URL
+const BOARD_API_URL = process.env.BOARD_API_URL || 'http://localhost:2644';
+
 // Force unbuffered logging
 const log = (msg: string) => process.stdout.write(`[bot] ${msg}\n`);
+
+// Cache webhooks per channel so we don't create duplicates
+const webhookCache = new Map<string, Webhook>();
+
+/**
+ * Get or create a webhook for a channel, used to post messages
+ * that appear to come from a specific user (with their name + avatar).
+ */
+async function getOrCreateWebhook(channel: TextChannel): Promise<Webhook> {
+    const cached = webhookCache.get(channel.id);
+    if (cached) return cached;
+
+    // Check for existing cord webhook
+    const webhooks = await channel.fetchWebhooks();
+    let webhook = webhooks.find(w => w.name === 'Cord');
+
+    if (!webhook) {
+        webhook = await channel.createWebhook({ name: 'Cord' });
+        log(`Created webhook for channel ${channel.id}`);
+    }
+
+    webhookCache.set(channel.id, webhook);
+    return webhook;
+}
+
+/**
+ * Post a message in a thread that appears to come from a specific user.
+ * Uses a channel webhook with the user's display name and avatar.
+ */
+async function sendAsUser(
+    threadId: string,
+    text: string,
+    user: { displayName: string; avatarURL: string | null },
+): Promise<void> {
+    const thread = await client.channels.fetch(threadId);
+    if (!thread?.isThread()) return;
+
+    const parentChannel = await client.channels.fetch(thread.parentId!) as TextChannel;
+    const webhook = await getOrCreateWebhook(parentChannel);
+
+    await webhook.send({
+        content: text,
+        username: user.displayName,
+        avatarURL: user.avatarURL || undefined,
+        threadId,
+    });
+}
 
 // Helper function to resolve working directory from message or channel config
 function resolveWorkingDir(message: string, channelId: string): { workingDir: string; cleanedMessage: string; error?: string } {
@@ -103,6 +157,55 @@ function resolveWorkingDir(message: string, channelId: string): { workingDir: st
     };
 }
 
+/** Extract image/file attachments from a Discord message */
+function extractAttachments(message: Message): Attachment[] {
+    return Array.from(message.attachments.values()).map(att => ({
+        url: att.url,
+        name: att.name,
+        contentType: att.contentType,
+    }));
+}
+
+/**
+ * Disable all buttons on a message (greyed out but still visible)
+ */
+async function disableActionButtons(threadId: string): Promise<void> {
+    const messageId = activeActionMessages.get(threadId);
+    if (!messageId) return;
+
+    try {
+        const channel = await client.channels.fetch(threadId);
+        if (!channel?.isTextBased()) return;
+
+        const msg = await (channel as TextChannel).messages.fetch(messageId);
+        const disabledRows = msg.components.map(row =>
+            ActionRowBuilder.from(row).setComponents(
+                row.components.map(c => ButtonBuilder.from(c as any).setDisabled(true))
+            )
+        ) as ActionRowBuilder<ButtonBuilder>[];
+
+        await msg.edit({ components: disabledRows });
+
+        // Clean up handlers for these buttons (memory + DB)
+        const customIds: string[] = [];
+        for (const row of msg.components) {
+            for (const component of row.components) {
+                if (component.customId) {
+                    buttonHandlers.delete(component.customId);
+                    customIds.push(component.customId);
+                }
+            }
+        }
+        deleteButtonHandlers(customIds);
+
+        activeActionMessages.delete(threadId);
+        log(`Disabled action buttons in thread ${threadId}`);
+    } catch (error) {
+        log(`Failed to disable buttons: ${error}`);
+        activeActionMessages.delete(threadId);
+    }
+}
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -115,28 +218,72 @@ const client = new Client({
 client.once(Events.ClientReady, async (c) => {
     log(`Logged in as ${c.user.tag}`);
 
-    // Register slash commands (only if not already registered)
-    const existingCommands = await c.application?.commands.fetch();
-    const cordCommand = existingCommands?.find(cmd => cmd.name === 'cord');
-
-    if (!cordCommand) {
-        const command = new SlashCommandBuilder()
-            .setName('cord')
-            .setDescription('Configure Cord bot')
-            .addSubcommand(sub =>
-                sub.setName('config')
-                   .setDescription('Configure channel settings')
-                   .addStringOption(opt =>
-                       opt.setName('dir')
-                          .setDescription('Working directory for Claude in this channel')
-                          .setRequired(true)
-                   )
-            );
-
-        await c.application?.commands.create(command);
-        log('Slash commands registered');
+    // Register slash commands as guild-specific (instant propagation)
+    const guild = c.guilds.cache.first();
+    if (!guild) {
+        log('WARNING: Bot is not in any guild, cannot register slash commands');
     } else {
-        log('Slash commands already registered');
+        log(`Registering guild commands for: ${guild.name} (${guild.id})`);
+
+        const existingCommands = await guild.commands.fetch();
+        const cordCommand = existingCommands?.find(cmd => cmd.name === 'cord');
+
+        if (!cordCommand) {
+            const command = new SlashCommandBuilder()
+                .setName('cord')
+                .setDescription('Configure Cord bot')
+                .addSubcommand(sub =>
+                    sub.setName('config')
+                       .setDescription('Configure channel settings')
+                       .addStringOption(opt =>
+                           opt.setName('dir')
+                              .setDescription('Working directory for Claude in this channel')
+                              .setRequired(true)
+                       )
+                );
+
+            await guild.commands.create(command);
+            log('/cord guild command registered');
+        } else {
+            log('/cord guild command already registered');
+        }
+
+        // Register /board and /board-close commands
+        const boardCommand = existingCommands?.find(cmd => cmd.name === 'board');
+        if (!boardCommand) {
+            const board = new SlashCommandBuilder()
+                .setName('board')
+                .setDescription('Start a board meeting on a topic')
+                .addStringOption(opt =>
+                    opt.setName('topic')
+                       .setDescription('The topic for the board meeting')
+                       .setRequired(true)
+                );
+            await guild.commands.create(board);
+            log('/board guild command registered');
+        }
+
+        const boardCloseCommand = existingCommands?.find(cmd => cmd.name === 'board-close');
+        if (!boardCloseCommand) {
+            const boardClose = new SlashCommandBuilder()
+                .setName('board-close')
+                .setDescription('Close the current board meeting');
+            await guild.commands.create(boardClose);
+            log('/board-close guild command registered');
+        }
+
+        // Clean up stale global commands (from previous registration)
+        try {
+            const globalCommands = await c.application?.commands.fetch();
+            if (globalCommands && globalCommands.size > 0) {
+                for (const [, cmd] of globalCommands) {
+                    await c.application?.commands.delete(cmd.id);
+                    log(`Deleted stale global command: /${cmd.name}`);
+                }
+            }
+        } catch (err) {
+            log(`Failed to clean up global commands: ${err}`);
+        }
     }
 
     // Start HTTP API server
@@ -180,11 +327,64 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         return;
     }
 
+    // Handle /board slash command
+    if (interaction.isChatInputCommand() && interaction.commandName === 'board') {
+        const topic = interaction.options.getString('topic', true);
+        await interaction.deferReply();
+        try {
+            const response = await fetch(`${BOARD_API_URL}/board/start`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ topic }),
+            });
+            const result = await response.json() as { message?: string; error?: string };
+            if (response.ok) {
+                await interaction.editReply(result.message || `Board meeting started on: ${topic}`);
+            } else {
+                await interaction.editReply(`Failed to start board meeting: ${result.error || response.statusText}`);
+            }
+        } catch (error) {
+            log(`/board error: ${error}`);
+            await interaction.editReply(`Failed to start board meeting: ${error}`);
+        }
+        return;
+    }
+
+    // Handle /board-close slash command
+    if (interaction.isChatInputCommand() && interaction.commandName === 'board-close') {
+        await interaction.deferReply();
+        try {
+            const response = await fetch(`${BOARD_API_URL}/board/close`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            const result = await response.json() as { message?: string; error?: string };
+            if (response.ok) {
+                await interaction.editReply(result.message || 'Board meeting closed.');
+            } else {
+                await interaction.editReply(`Failed to close board meeting: ${result.error || response.statusText}`);
+            }
+        } catch (error) {
+            log(`/board-close error: ${error}`);
+            await interaction.editReply(`Failed to close board meeting: ${error}`);
+        }
+        return;
+    }
+
     if (!interaction.isButton()) return;
 
     log(`Looking up handler for: ${interaction.customId}`);
-    log(`Available handlers: ${Array.from(buttonHandlers.keys()).join(', ') || 'none'}`);
-    const handler = buttonHandlers.get(interaction.customId);
+    // Check in-memory first, fall back to DB (survives restarts)
+    let handler = buttonHandlers.get(interaction.customId);
+    if (!handler) {
+        const persisted = loadButtonHandler(interaction.customId);
+        if (persisted) {
+            handler = persisted as typeof handler;
+            buttonHandlers.set(interaction.customId, handler);
+            log(`Loaded handler from DB: ${interaction.customId}`);
+        }
+    }
     if (!handler) {
         log(`No handler found for: ${interaction.customId}`);
         await interaction.reply({ content: 'This button has expired.', ephemeral: true });
@@ -211,6 +411,52 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
             });
             const result = await response.json() as { content?: string };
             await interaction.editReply({ content: result.content || 'Done.' });
+        } else if (handler.type === 'thread-reply') {
+            // Acknowledge the click silently
+            await interaction.deferUpdate();
+
+            const threadId = interaction.channelId!;
+            const text = handler.text;
+
+            // Disable buttons on this message
+            await disableActionButtons(threadId);
+
+            // Post the button text as if the user typed it
+            await sendAsUser(threadId, text, {
+                displayName: interaction.user.displayName,
+                avatarURL: interaction.user.displayAvatarURL(),
+            }).catch(e => log(`Failed to send as user: ${e}`));
+
+            // Look up session for this thread and queue a Claude job
+            const channel = await client.channels.fetch(threadId);
+            const mapping = db.query('SELECT session_id, working_dir FROM threads WHERE thread_id = ?')
+                .get(threadId) as { session_id: string; working_dir: string | null } | null;
+
+            if (mapping) {
+                const workingDir = mapping.working_dir ||
+                    getChannelConfigCached((channel as any)?.parentId || '')?.working_dir ||
+                    process.env.CLAUDE_WORKING_DIR ||
+                    process.cwd();
+
+                // Show typing indicator
+                if (channel?.isTextBased()) {
+                    await (channel as TextChannel).sendTyping();
+                }
+
+                await claudeQueue.add('process', {
+                    prompt: text,
+                    threadId,
+                    sessionId: mapping.session_id,
+                    resume: true,
+                    userId: interaction.user.id,
+                    username: interaction.user.tag,
+                    workingDir,
+                });
+
+                log(`Thread-reply button: queued "${text}" for thread ${threadId}`);
+            } else {
+                log(`Thread-reply button: no session found for thread ${threadId}`);
+            }
         }
     } catch (error) {
         log(`Button handler error: ${error}`);
@@ -234,8 +480,8 @@ client.on(Events.MessageCreate, async (message: Message) => {
         const thread = message.channel;
 
         // Look up session ID and working dir for this thread
-        const mapping = db.query('SELECT session_id, working_dir FROM threads WHERE thread_id = ?')
-            .get(thread.id) as { session_id: string; working_dir: string | null } | null;
+        const mapping = db.query('SELECT session_id, working_dir, context, needs_init, webhook_url FROM threads WHERE thread_id = ?')
+            .get(thread.id) as { session_id: string; working_dir: string | null; context: string | null; needs_init: number; webhook_url: string | null } | null;
 
         if (!mapping) {
             // Not a thread we created, ignore
@@ -243,6 +489,26 @@ client.on(Events.MessageCreate, async (message: Message) => {
         }
 
         log(`Thread message from ${message.author.tag}`);
+
+        // Disable any active action buttons (user typed instead of clicking)
+        disableActionButtons(thread.id).catch(e => log(`Disable buttons error: ${e}`));
+
+        // Webhook threads: forward to webhook URL instead of Claude
+        if (mapping.webhook_url) {
+            log(`Webhook thread message from ${message.author.tag} → ${mapping.webhook_url}`);
+            await thread.sendTyping();
+            const content = message.content.replace(/<@!?\d+>/g, '').trim();
+            try {
+                await fetch(mapping.webhook_url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: content }),
+                });
+            } catch (error) {
+                log(`Webhook error: ${error}`);
+            }
+            return;
+        }
 
         // Show typing indicator
         await thread.sendTyping();
@@ -256,15 +522,27 @@ client.on(Events.MessageCreate, async (message: Message) => {
             process.env.CLAUDE_WORKING_DIR ||
             process.cwd();
 
-        // Queue for Claude processing with session resume
+        // Pre-registered threads (notifications) need initialization on first reply
+        const isInit = mapping.needs_init === 1;
+        const prompt = isInit && mapping.context
+            ? `[You sent this notification to Jon]\n---\n${mapping.context}\n---\n\nJon's reply: ${content}`
+            : content;
+
+        if (isInit) {
+            clearThreadInit(thread.id);
+        }
+
+        // Queue for Claude processing
+        const attachments = extractAttachments(message);
         await claudeQueue.add('process', {
-            prompt: content,
+            prompt,
             threadId: thread.id,
             sessionId: mapping.session_id,
-            resume: true,
+            resume: !isInit,
             userId: message.author.id,
             username: message.author.tag,
             workingDir,
+            ...(attachments.length > 0 && { attachments }),
         });
 
         return;
@@ -289,32 +567,18 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
     log(`Working directory: ${workingDir}`);
 
-    // Post status message in channel, then create thread from it
-    // This allows us to update the status message later (Processing... → Done)
-    let statusMessage;
+    // Create thread directly from the user's message —
+    // their @mention becomes the thread starter, no "Processing..." needed
     let thread;
     try {
-        // Post status message in the channel
-        statusMessage = await (message.channel as TextChannel).send('Processing...');
-
-        // Generate thread name from cleaned message content
         const threadName = cleanedMessage.length > 50
             ? cleanedMessage.slice(0, 47) + '...'
             : cleanedMessage || 'New conversation';
 
-        // Create thread from the status message
-        thread = await statusMessage.startThread({
+        thread = await message.startThread({
             name: threadName,
             autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
         });
-
-        // Copy the original message content into the thread for context
-        // (excluding the bot mention and the status message)
-        const originalMessages = await message.channel.messages.fetch({ limit: 10 });
-        const userMessage = originalMessages.find(m => m.id === message.id);
-        if (userMessage) {
-            await thread.send(`**${message.author.tag}:** ${cleanedMessage}`);
-        }
     } catch (error) {
         log(`Failed to create thread: ${error}`);
         await message.reply('Failed to start thread. Try again?');
@@ -337,6 +601,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
     await thread.sendTyping();
 
     // Queue for Claude processing
+    const attachments = extractAttachments(message);
     await claudeQueue.add('process', {
         prompt: cleanedMessage,
         threadId: thread.id,
@@ -345,6 +610,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
         userId: message.author.id,
         username: message.author.tag,
         workingDir,
+        ...(attachments.length > 0 && { attachments }),
     });
 });
 

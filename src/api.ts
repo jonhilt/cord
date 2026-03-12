@@ -5,7 +5,8 @@
  * and managing threads. Useful for scripts, automation, and Claude skills.
  */
 
-import { Client, TextChannel, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import { Client, TextChannel, ThreadAutoArchiveDuration, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import { registerThread, registerWebhookThread, saveButtonHandler, loadButtonHandler, deleteButtonHandler, deleteButtonHandlers } from './db.js';
 
 const log = (msg: string) => process.stdout.write(`[api] ${msg}\n`);
 
@@ -18,9 +19,16 @@ type ButtonHandler = {
     type: 'webhook';
     url: string;
     data?: Record<string, unknown>;
+} | {
+    type: 'thread-reply';
+    text: string;
 };
 
 export const buttonHandlers = new Map<string, ButtonHandler>();
+
+// Track the last action-button message per thread so we can disable on new messages
+// Map<threadId, messageId>
+export const activeActionMessages = new Map<string, string>();
 
 /**
  * Start the HTTP API server
@@ -149,9 +157,10 @@ export function startApiServer(client: Client, port: number = 2643) {
                     };
 
                     const buttons = body.buttons.map(b => {
-                        // Register handler if provided
+                        // Register handler in memory + persist to DB
                         if (b.handler) {
                             buttonHandlers.set(b.customId, b.handler);
+                            saveButtonHandler(b.customId, b.handler);
                             log(`Registered button handler: ${b.customId}`);
                         } else {
                             log(`No handler for button: ${b.customId}`);
@@ -162,13 +171,23 @@ export function startApiServer(client: Client, port: number = 2643) {
                             .setStyle(styleMap[b.style] || ButtonStyle.Primary);
                     });
 
-                    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(buttons);
+                    // Split buttons into rows of 5 (Discord limit per ActionRow)
+                    const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+                    for (let i = 0; i < buttons.length; i += 5) {
+                        rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(buttons.slice(i, i + 5)));
+                    }
 
                     const message = await (channel as TextChannel).send({
-                        content: body.content || undefined,
+                        ...(body.content ? { content: body.content } : {}),
                         embeds: embeds || undefined,
-                        components: [row],
+                        components: rows,
                     });
+
+                    // Track action button messages so we can disable them later
+                    const hasThreadReply = body.buttons.some(b => b.handler?.type === 'thread-reply');
+                    if (hasThreadReply) {
+                        activeActionMessages.set(body.channelId, message.id);
+                    }
 
                     return new Response(JSON.stringify({
                         success: true,
@@ -321,6 +340,33 @@ async function handleCommand(
             return { success: true, threadId: thread.id };
         }
 
+        case 'register-notification-thread': {
+            const channelId = args.channel as string;
+            const messageId = args.message as string;
+            const context = args.context as string | undefined;
+            const workingDir = (args.workingDir as string) || process.env.CLAUDE_WORKING_DIR || process.cwd();
+            const threadName = (args.name as string) || (context
+                ? (context.length > 50 ? context.slice(0, 47) + '...' : context)
+                : 'Notification');
+
+            const channel = await client.channels.fetch(channelId);
+            if (!channel?.isTextBased()) {
+                throw new Error('Invalid channel');
+            }
+
+            const message = await (channel as TextChannel).messages.fetch(messageId);
+            const thread = await message.startThread({
+                name: threadName,
+                autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+            });
+
+            const sessionId = crypto.randomUUID();
+            registerThread(thread.id, sessionId, workingDir, context || null);
+
+            log(`Registered notification thread ${thread.id} with session ${sessionId}`);
+            return { success: true, threadId: thread.id, sessionId };
+        }
+
         case 'add-reaction': {
             const channelId = args.channel as string;
             const messageId = args.message as string;
@@ -333,6 +379,46 @@ async function handleCommand(
 
             const message = await (channel as TextChannel).messages.fetch(messageId);
             await message.react(emoji);
+            return { success: true };
+        }
+
+        case 'create-forum-post': {
+            const channelId = args.channel as string;
+            const name = args.name as string;
+            const content = args.content as string;
+
+            const channel = await client.channels.fetch(channelId);
+            if (!channel?.isThreadOnly()) {
+                throw new Error('Channel is not a forum channel');
+            }
+
+            const thread = await (channel as any).threads.create({
+                name,
+                message: { content },
+            });
+
+            return { success: true, threadId: thread.id, messageId: thread.id };
+        }
+
+        case 'create-thread-from-thread': {
+            const threadId = args.thread as string;
+            const messageId = args.message as string;
+            const name = args.name as string;
+
+            const thread = await client.channels.fetch(threadId);
+            if (!thread?.isThread()) {
+                throw new Error('Not a thread');
+            }
+
+            const message = await thread.messages.fetch(messageId);
+            const subThread = await message.startThread({ name });
+            return { success: true, threadId: subThread.id };
+        }
+
+        case 'register-webhook-thread': {
+            const threadId = args.thread as string;
+            const webhookUrl = args.webhookUrl as string;
+            registerWebhookThread(threadId, webhookUrl);
             return { success: true };
         }
 

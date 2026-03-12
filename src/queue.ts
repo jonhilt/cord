@@ -31,6 +31,13 @@ export const claudeQueue = new Queue('claude', {
     },
 });
 
+// Attachment from Discord (images, files, etc.)
+export interface Attachment {
+    url: string;
+    name: string;
+    contentType: string | null;
+}
+
 // Job data structure
 export interface ClaudeJob {
     prompt: string;
@@ -40,4 +47,5 @@ export interface ClaudeJob {
     userId: string;
     username: string;
     workingDir?: string;
+    attachments?: Attachment[];
 }
